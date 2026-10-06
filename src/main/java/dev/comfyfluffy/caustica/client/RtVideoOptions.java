@@ -56,8 +56,7 @@ public final class RtVideoOptions {
                 airFogNoon(), volumetricLight(), volumetricAbsorption(),
             }),
             new Section("caustica.options.rt.group.clouds", new OptionInstance<?>[] {
-                planarClouds(), cloudQuality(), cloudLayers(), cloudSamples(), cloudCoverage(),
-                cloudDensity(), cloudSpeed(),
+                clouds(), cloudQuality(), cloudCoverage(), cloudDetail(),
             }),
             new Section("caustica.options.rt.group.debug", new OptionInstance<?>[] {
                 debugView(),
@@ -340,62 +339,39 @@ public final class RtVideoOptions {
             percent -> setting.set(percent / 100.0f));
     }
 
-    private static OptionInstance<Boolean> planarClouds() {
-        return bool("caustica.options.rt.planarClouds", CausticaConfig.Rt.Composite.PLANAR_CLOUDS);
+    private static OptionInstance<Boolean> clouds() {
+        return bool("caustica.options.rt.clouds", CausticaConfig.Rt.Clouds.ENABLED);
     }
 
-    private static OptionInstance<Integer> cloudQuality() {
-        IntSetting setting = CausticaConfig.Rt.Composite.CLOUD_QUALITY;
-        return new OptionInstance<>(
+    /** Quality preset: index 0 is the off switch, so the order in Clouds.QUALITY_PRESETS is load-bearing. */
+    private static OptionInstance<String> cloudQuality() {
+        StringSetting setting = CausticaConfig.Rt.Clouds.QUALITY;
+        List<String> presets = CausticaConfig.Rt.Clouds.QUALITY_PRESETS;
+        String initial = presets.contains(setting.get()) ? setting.get() : presets.get(0);
+        return new OptionInstance<String>(
             "caustica.options.rt.cloudQuality",
             OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.cloudQuality.tooltip")),
-            (caption, value) -> Options.genericValueLabel(caption,
-                    Component.translatable("caustica.options.rt.cloudQuality." + value)),
-            new OptionInstance.IntRange(0, 2),
-            Math.clamp(setting.value(), 0, 2),
-            setting::set);
+            (caption, value) -> Component.translatable("caustica.options.rt.cloudQuality." + value),
+            new OptionInstance.Enum<>(presets, Codec.STRING),
+            initial,
+            value -> setting.set(value));
     }
 
     private static OptionInstance<Integer> cloudCoverage() {
-        return cloudPercent("caustica.options.rt.cloudCoverage", CausticaConfig.Rt.Composite.CLOUD_COVERAGE);
+        return cloudPercent("caustica.options.rt.cloudCoverage", CausticaConfig.Rt.Clouds.COVERAGE);
     }
 
-    private static OptionInstance<Integer> cloudLayers() {
-        IntSetting setting = CausticaConfig.Rt.Composite.CLOUD_LAYERS;
-        return new OptionInstance<>(
-            "caustica.options.rt.cloudLayers",
-            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.cloudLayers.tooltip")),
-            (caption, value) -> Options.genericValueLabel(caption, Component.literal(Integer.toString(value))),
-            new OptionInstance.IntRange(1, 2),
-            Math.clamp(setting.value(), 1, 2),
-            setting::set);
+    private static OptionInstance<Integer> cloudDetail() {
+        return cloudPercent("caustica.options.rt.cloudDetail", CausticaConfig.Rt.Clouds.DETAIL);
     }
 
-    private static OptionInstance<Integer> cloudSamples() {
-        IntSetting setting = CausticaConfig.Rt.Composite.CLOUD_SAMPLES;
-        return new OptionInstance<>(
-            "caustica.options.rt.cloudSamples",
-            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.cloudSamples.tooltip")),
-            (caption, value) -> Options.genericValueLabel(caption, Component.literal(Integer.toString(value))),
-            new OptionInstance.IntRange(8, 64),
-            Math.clamp(setting.value(), 8, 64),
-            setting::set);
-    }
-
-    private static OptionInstance<Integer> cloudDensity() {
-        return cloudPercent("caustica.options.rt.cloudDensity", CausticaConfig.Rt.Composite.CLOUD_DENSITY);
-    }
-
-    private static OptionInstance<Integer> cloudSpeed() {
-        return cloudPercent("caustica.options.rt.cloudSpeed", CausticaConfig.Rt.Composite.CLOUD_SPEED);
-    }
-
+    /** 0..100% over a float setting that lives in 0..1. */
     private static OptionInstance<Integer> cloudPercent(String key, FloatSetting setting) {
         return new OptionInstance<>(key,
             OptionInstance.cachedConstantTooltip(Component.translatable(key + ".tooltip")),
             (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
-            new OptionInstance.IntRange(0, 200),
-            Math.clamp(Math.round(setting.value() * 100.0f), 0, 200),
+            new OptionInstance.IntRange(0, 100),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 100),
             percent -> setting.set(percent / 100.0f));
     }
 

@@ -22,7 +22,8 @@ import water;
 import trace;
 import water_volume;
 import air_volume;
-import cloud_volume;
+import sky;
+import clouds;
 import guides;
 
 public PathSegment tracePrimary(PathSegment seg,
@@ -45,6 +46,8 @@ public PathSegment tracePrimary(PathSegment seg,
     float waterFogStrength = clamp(worldPush.waterAnchor.w, 0.0, 2.0);
     nextRecord = PATH_NO_NEXT;
     prefixRadiance = float3(0.0, 0.0, 0.0);
+    // Representative depth of the air fog this segment integrated, for the DLSS-RR guide below (< 0 = none).
+    float airGuideDepth = -1.0;
 
     {
         int bounce = seg.bounce;
@@ -61,33 +64,64 @@ public PathSegment tracePrimary(PathSegment seg,
             AirVolumeResult air = integrateAirVolume(ro, rd, segmentDistance, true, airSeed);
             prefixRadiance += throughput * air.radiance;
             throughput *= air.transmittance;
+            airGuideDepth = air.depth;
             terminal.throughput = throughput;
         }
 
-        // A miss already composites clouds over the sky. For a terrain hit, the same
-        // cloud segment must be composited before the surface when viewed from above.
-        if (payload.hitT >= 0.0 && mediumIsAir(medium.current)
-                && (worldPush.flags & (1u << 9u)) != 0u) {
-            float rain = clamp(worldPush.weather.x, 0.0, 1.0);
-            float thunder = clamp(worldPush.weather.y, 0.0, 1.0);
-            float direct = clamp(1.0 - rain * 0.72 - thunder * 0.18, 0.10, 1.0);
-            float lightning = thunder * smoothstep(0.78, 1.0, worldPush.weather.z);
-            float weatherSky = clamp(direct + lightning * (1.0 - direct) * 0.80, 0.10, 1.0);
-            VolumeCloudResult cloud = integrateVolumetricCloud(
-                    worldPush, ro, rd, payload.hitT, weatherSky);
-            prefixRadiance += throughput * cloud.radiance;
-            throughput *= cloud.transmittance;
-            terminal.throughput = throughput;
+        // A miss already composites clouds over the sky (world.rmiss). For a terrain hit, the same
+        // cloud segment must be composited before the surface when the deck sits between the camera and
+        // the ground, so the layer is integrated here instead of being skipped.
+        if (payload.hitT >= 0.0 && mediumIsAir(medium.current)) {
+            CloudLayer cloudDeck = cloudLayer(worldPush);
+            if (cloudLayerActive(cloudDeck)) {
+                float rain = clamp(worldPush.weather.x, 0.0, 1.0);
+                float thunder = clamp(worldPush.weather.y, 0.0, 1.0);
+                float direct = clamp(1.0 - rain * 0.72 - thunder * 0.18, 0.10, 1.0);
+                float lightning = thunder * smoothstep(0.78, 1.0, worldPush.weather.z);
+                float weatherSky = clamp(direct + lightning * (1.0 - direct) * 0.80, 0.10, 1.0);
+                float jitter = cloudJitter(cloudDeck, float2(pixelIndex & 0xFFFFu, pixelIndex >> 16u),
+                        worldPush.frameIndex);
+                float3 cloudAmbient = atmosphere(float3(0.0, 1.0, 0.0), worldPush.sunDir.xyz) * weatherSky;
+                CloudResult cloud = marchClouds(ro, rd, payload.hitT, cloudDeck,
+                        worldPush.lightDir.xyz, max(worldPush.lightRadiance.xyz, float3(0.0, 0.0, 0.0)),
+                        cloudAmbient, jitter);
+                prefixRadiance += throughput * (cloud.scattering + cloudDeck.lightning * cloud.scattering);
+                throughput *= cloud.transmittance;
+                terminal.throughput = throughput;
+            }
         }
 
         if (payload.hitT < 0.0) {
             if (bounce == 0) {
+                // A cloud hit is still a miss for the path integrator — the layer is a participating medium,
+                // not a surface — but DLSS-RR still needs a finite depth for it. Reporting the sky's far
+                // plane makes RR reproject the layer as if it were infinitely distant, which is what leaves
+                // the march's step lattice unconverged at range (horizontal banding) and ghosts as soon as
+                // the wind moves it. world.rmiss publishes the layer's optical-depth-weighted centroid in
+                // the miss-side rayCone lane; a negative value means this ray saw no cloud and the far plane
+                // stands.
+                float cloudDepth = asfloat(payload.rayCone);
+                bool cloudHit = cloudDepth > 0.0;
+                float guideDistance = cloudHit ? cloudDepth : 1.0e6;
+                // Air fog is a medium too: when it is the only thing between the camera and the sky, its own
+                // representative depth keeps the haze from being reprojected as infinitely distant, which is
+                // what left its sample lattice on screen as banding.
+                if (!cloudHit && airGuideDepth > 0.0) {
+                    guideDistance = airGuideDepth;
+                }
                 gv_normal = float3(0.0, 0.0, 0.0);
                 gv_albedo = SKY_DIFF_ALBEDO;
                 gv_rough = 1.0;
-                gv_hitCamRel = rd * 1.0e6;
+                gv_hitCamRel = rd * guideDistance;
                 gv_motionUseRefracted = false;
-                gv_motionObjDisp = float3(0.0, 0.0, 0.0);
+                // The layer advects with the wind, and the motion guide has to carry that displacement:
+                // reporting zero tells RR the cloud stands still in the world, so it reprojects last frame's
+                // cloud onto this frame's — a mismatch that reads as blur and ghosting rather than as
+                // motion. Sky keeps a zero displacement, which is correct for it. cloudC.yz is this frame's
+                // wind increment, the same amount the cloud noise domain advanced by.
+                gv_motionObjDisp = cloudHit
+                        ? float3(worldPush.cloudC.y, 0.0, worldPush.cloudC.z)
+                        : float3(0.0, 0.0, 0.0);
                 gv_spec = makeSpecSurface(gv_hitCamRel, gv_normal, 1.0, SKY_SPEC_ALBEDO);
             }
             return terminal;

@@ -111,6 +111,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     // glowing) per submitModel call — see EntityRenderer.extractCommon's outlineColor. Every submitModel
     // call for one entity carries the same value, so the last non-zero one seen this entity is enough.
     private int outlineColor;
+    // Red damage-flash blend weight for the entity currently being captured, forwarded to the capture on
+    // every model submission. Reset per entity by begin(); see redOverlayWeight.
+    private float damageOverlay;
 
     /**
      * Point the collector at the capture buffer for the next {@code dispatcher.submit}, resetting the
@@ -122,6 +125,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         this.profileDynamicEntity = capture != null && profileDynamicEntity;
         if (capture != null) {
             this.outlineColor = 0;
+            this.damageOverlay = 0f;
             this.pendingOrder = 0;
         }
     }
@@ -154,6 +158,12 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (outlineColor != 0) {
             this.outlineColor = outlineColor;
         }
+        // Vanilla resolves the red hurt flash from the packed overlay coordinate handed to this submission
+        // (row 3 of the overlay texture). Collapse it here and push it into the capture's spare prim lane,
+        // which the entity hit shader blends the albedo with. Taking the max across submissions makes a
+        // multi-layer model (body plus feature layers) flash as one body instead of per layer.
+        damageOverlay = Math.max(damageOverlay, redOverlayWeight(overlayCoords));
+        capture.currentAux1 = damageOverlay;
         // Vanilla gives the base-colour banner pass order 0 even though it is drawn after an uncoloured,
         // exactly coplanar cloth pass. Move every banner-pattern pass out one rank: base colour becomes 1,
         // and the explicitly ordered emblem layers become 2+. Otherwise the BVH can select white cloth.
@@ -346,6 +356,24 @@ public final class RtEntityCollector implements SubmitNodeCollector {
 
     /** Whether a render type is alpha-blended (translucent) — its pipeline's color target has a blend
      *  function. Cutout/solid have none. Drives stochastic entity transparency in world.rahit. */
+    // Row 3 of vanilla's overlay texture is the red hurt tint; row 10 is "no overlay". The packed
+    // coordinate carries the row in its high half (see OverlayTexture.pack).
+    private static final int OVERLAY_RED_ROW = 3;
+    private static final float RED_OVERLAY_BLEND = 0.3f;
+
+    /**
+     * Weight the entity's packed overlay coordinate contributes to the red damage flash.
+     *
+     * <p>Vanilla draws that flash in the entity fragment shader as
+     * {@code mix(overlayColor.rgb, color.rgb, overlayColor.a)} with the overlay texture's red texel, so the
+     * 0.7 alpha of that row collapses into a 0.3 blend toward red. The ray tracer samples no overlay texture,
+     * so the weight rides the prim record instead and world.rchit blends the albedo with it, which keeps the
+     * flash inside the path tracer's light transport rather than painting it over the finished image.
+     */
+    private static float redOverlayWeight(int packedOverlay) {
+        return ((packedOverlay >>> 16) & 0xFFFF) == OVERLAY_RED_ROW ? RED_OVERLAY_BLEND : 0.0f;
+    }
+
     private static boolean isTranslucent(RenderType renderType) {
         if (renderType == null) {
             return false;

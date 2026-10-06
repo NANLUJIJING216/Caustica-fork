@@ -20,6 +20,7 @@ import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float3;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float4;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Int4;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
@@ -30,6 +31,10 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.attribute.EnvironmentAttributes;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.MoonPhase;
 import net.minecraft.world.level.material.FluidState;
 import org.joml.Matrix4f;
@@ -149,6 +154,31 @@ public final class RtComposite {
     // Finite sun/moon angular sizes let NEE shadow rays sample the light disk (soft, contact-hardening
     // penumbrae). Radii in degrees; the real sun/moon are ~0.27°, but a touch larger reads pleasantly.
     private static final int WATER_ANCHOR_MASK = 4095;
+
+    // ---- Volumetric cloud quality presets (clouds.slang). Indexed by
+    // CausticaConfig.Rt.Clouds.QUALITY_PRESETS, whose index 0 is "off": every entry at index 0 is a
+    // switch that publishes an empty layer. Each preset is a CEILING on the matching setting rather
+    // than an override, which is why "off" is the only entry that forces the layer off.
+    private static final int[] CLOUD_QUALITY_STEP_CAP        = {0, 16, 32, 64, 128};
+    private static final int[] CLOUD_QUALITY_LIGHT_STEPS     = {0, 3, 4, 6, 8};
+    private static final int[] CLOUD_QUALITY_SCATTER_OCTAVES = {0, 2, 3, 4, 5};
+    private static final int[] CLOUD_QUALITY_NOISE_OCTAVES   = {0, 2, 3, 3, 4};
+    // Block-light level above which the camera counts as being under open sky (0..15).
+    private static final int WET_SKY_LIGHT_MIN = 8;
+
+    // ---- The End (see WORLD_FLAG_END_SKY in world_common.slang).
+    //
+    // The End's moon is that dimension's only light, so it is boosted (a legibility constant, not a physical
+    // one) and dull red — the same two numbers sky.slang draws the disc with, so the light NEE samples, the
+    // haze the fog scatters and the visible disc cannot disagree about what colour it is.
+    private static final float END_MOON_BOOST = 6.0f;
+    private static final float END_MOON_COLOR_R = 1.0f;
+    private static final float END_MOON_COLOR_G = 0.34f;
+    private static final float END_MOON_COLOR_B = 0.24f;
+    // Haze strength the End publishes through the cloud layer's rain lane: the whole dimension is filled
+    // with violet fog, thickest while the dragon fight is running.
+    private static final float END_HAZE_DRAGON_LIVE = 1.0f;
+    private static final float END_HAZE_DRAGON_DEAD = 0.2f;
     private static final Identifier SUN_ID = Identifier.withDefaultNamespace("sun");
     private static final Identifier[] MOON_IDS = createMoonIds();
     // Celestial rotation axis (the pole the sun/moon arc about): perpendicular to the east-west arc,
@@ -314,6 +344,12 @@ public final class RtComposite {
     private boolean mvHasPrev;
     private float previousWaterWaveTime;
     private boolean waterWaveTimeValid;
+    // Volumetric cloud drift, accumulated in world blocks from a wall-clock delta. Not wrapped: the
+    // cloud noise domain is not periodic, so a wrap would jump the whole layer. tuning.yz carries the
+    // per-frame increment for DLSS-RR motion while these carry the running total.
+    private double cloudDriftX;
+    private double cloudDriftZ;
+    private long cloudDriftNanos;
     private long atlasSampler;
     private long materialPageSampler;
     private boolean failed;
@@ -929,6 +965,11 @@ public final class RtComposite {
             if (CausticaConfig.Rt.Composite.PLANAR_CLOUDS.value()) {
                 flags |= 1 << 9;
             }
+            if (level != null && level.dimension() == Level.END) {
+                // WORLD_FLAG_END_SKY. One verdict, read by the miss shader (no atmosphere, red moon, plain
+                // starfield), by rainfog (haze rather than precipitation) and by the wet film.
+                flags |= 1 << 2;
+            }
             flags |= CausticaConfig.Rt.Composite.CLOUD_QUALITY.value() << 10;
             flags |= Math.round(CausticaConfig.Rt.Composite.CLOUD_DENSITY.value() * 100.0f) << 24;
             flags |= RtParallax.flags(CausticaConfig.Rt.Composite.PARALLAX.value(),
@@ -975,11 +1016,14 @@ public final class RtComposite {
             // resolved slot rides along with the uploadPending() call right below.
             BreakEntry[] breaking = breakingEntries(terrain);
             SkyPush sky = skyPush(terrain);
-            // Full X/Z rebase keeps the non-periodic cloud field continuous across terrain rebases.
-            // Float integer precision becomes coarse only at extreme coordinates beyond ~16M blocks.
-            Float4 cloudAnchor = new Float4(terrain.blockX, terrain.blockZ,
-                    CausticaConfig.Rt.Composite.CLOUD_COVERAGE.value(),
-                    CausticaConfig.Rt.Composite.CLOUD_SPEED.value());
+            // The volumetric layer's geometry, wind, shading controls and step budget for this frame.
+            // cloudAnchor is the FULL rebase origin (x, y AND z): the shader adds it back to a ray origin
+            // before sampling the noise, which is what pins the non-periodic cloud field to the world
+            // across terrain rebases instead of letting it follow the player. w is the CPU's open-sky
+            // verdict for the camera.
+            CloudPush clouds = cloudPush();
+            Float4 cloudAnchor = new Float4(terrain.blockX, terrain.blockY, terrain.blockZ,
+                    clouds.skyExposed() ? 1f : 0f);
             // Air fog density = strength x base x weather x time of day, every factor a setting so the
             // haze can be shaped in-game. Java knows rain, thunder and the sun height, so the whole
             // product is computed here and the shader just consumes a density. cloudTuning.z carries the
@@ -1035,7 +1079,11 @@ public final class RtComposite {
                     new Float4(terrain.lightGridOriginX(), terrain.lightGridOriginY(), terrain.lightGridOriginZ(), 16f),
                     new Int4(terrain.lightGridDimX(), terrain.lightGridDimY(), terrain.lightGridDimZ(), 0),
                     terrain.lightCount(),
-                    CausticaConfig.Rt.Lights.RIS_CANDIDATES.value()
+                    CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
+                    clouds.layer(),
+                    clouds.drift(),
+                    clouds.tuning(),
+                    clouds.budget()
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.
@@ -1218,6 +1266,96 @@ public final class RtComposite {
 
     private record CelestialUv(Float4 sun, Float4 moon) {}
 
+    /** One frame of volumetric-cloud parameters, in the lanes clouds.slang decodes. */
+    private record CloudPush(Float4 layer, Float4 drift, Float4 tuning, Int4 budget, boolean skyExposed) {}
+
+    /**
+     * Whether the End's dragon is still alive. It decides how thick that dimension's haze is (see
+     * {@link #cloudPush}): the violet fog is part of the fight, not a constant of the sky.
+     */
+    private static boolean endDragonAlive(ClientLevel level) {
+        for (Entity entity : level.entitiesForRendering()) {
+            if (entity instanceof EnderDragon dragon && dragon.isAlive()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Resolve this frame's cloud layer for {@link WorldPushData}: the layer's geometry and coverage
+     * (layer), its wind displacement and lightning scale (drift), the march's jitter and this frame's
+     * wind increment (tuning), and the step/octave budget the quality preset allows (budget).
+     *
+     * <p>Altitudes are world blocks and are NOT rebased — {@code cloudAnchor} is the rebase origin and
+     * the shader adds it back before evaluating the noise, so subtracting terrain.blockY here (as
+     * camOffset does) would make the whole layer jump with the rebase.
+     *
+     * <p>Weather only ever adds cloud: rain raises coverage, thickens the deck and scales density, and
+     * thunder widens the lightning term. Nothing here reads Minecraft's own CLOUD_HEIGHT/CLOUD_COLOR;
+     * the layer's shape is the shader's and its lighting is the sky's.
+     */
+    private CloudPush cloudPush() {
+        Float4 zero = new Float4(0f, 0f, 0f, 0f);
+        Int4 zeroBudget = new Int4(0, 0, 0, 0);
+        Minecraft mc = Minecraft.getInstance();
+        ClientLevel level = mc.level;
+        if (level != null && level.dimension() == Level.END) {
+            // The End has no atmosphere to build a deck out of, so the layer is published empty — but its
+            // rain lane is not wasted there: rainfog reads it as the dimension's haze strength, thickest
+            // while the dragon lives and thinner once it has been beaten.
+            float haze = endDragonAlive(level) ? END_HAZE_DRAGON_LIVE : END_HAZE_DRAGON_DEAD;
+            return new CloudPush(zero, zero, new Float4(0f, 0f, 0f, haze), zeroBudget, true);
+        }
+        int quality = Math.max(0,
+                CausticaConfig.Rt.Clouds.QUALITY_PRESETS.indexOf(CausticaConfig.Rt.Clouds.QUALITY.get()));
+        int steps = CausticaConfig.Rt.Clouds.ENABLED.value()
+                ? Math.min(CausticaConfig.Rt.Clouds.STEPS.value(), CLOUD_QUALITY_STEP_CAP[quality])
+                : 0;
+        float rain = 0f;
+        float thunder = 0f;
+        boolean skyExposed = false;
+        if (level != null) {
+            float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+            rain = level.getRainLevel(partial);
+            thunder = level.getThunderLevel(partial);
+            skyExposed = level.getBrightness(LightLayer.SKY, cameraBlockPos) >= WET_SKY_LIGHT_MIN;
+        }
+        float weatherResponse = CausticaConfig.Rt.Clouds.WEATHER_RESPONSE.value();
+        float wet = Mth.clamp(rain * weatherResponse, 0f, 1f);
+        // Wall-clock drift, not game time: the layer keeps moving while the game is paused on a menu,
+        // which is what the 0.1.0 build did and what keeps the deck from stuttering on world load.
+        long now = System.nanoTime();
+        double dt = cloudDriftNanos != 0L ? (now - cloudDriftNanos) * 1.0e-9 : 0.0;
+        cloudDriftNanos = now;
+        double windSpeed = CausticaConfig.Rt.Clouds.WIND_SPEED.value();
+        float stepX = (float) (dt * windSpeed * 0.94);
+        float stepZ = (float) (dt * windSpeed * 0.34);
+        cloudDriftX += stepX;
+        cloudDriftZ += stepZ;
+        if (steps <= 0) {
+            // "off" preset, disabled, or steps = 0: an empty layer. A zero thickness is the shader's
+            // own off switch, so nothing else has to stay in sync with it.
+            return new CloudPush(zero, zero, zero, zeroBudget, skyExposed);
+        }
+        float thickness = CausticaConfig.Rt.Clouds.THICKNESS.value()
+                * (1f + wet * 0.6f + Mth.clamp(thunder, 0f, 1f) * weatherResponse * 0.5f);
+        float lightning = thunder > 0.01f
+                ? CausticaConfig.Rt.Clouds.LIGHTNING.value() * Mth.clamp(thunder, 0f, 1f)
+                : 0f;
+        return new CloudPush(
+                new Float4(Mth.clamp(CausticaConfig.Rt.Clouds.COVERAGE.value() + wet * 0.35f, 0f, 1f),
+                        CausticaConfig.Rt.Clouds.DENSITY.value(),
+                        CausticaConfig.Rt.Clouds.BASE_ALTITUDE.value(),
+                        thickness),
+                new Float4(CausticaConfig.Rt.Clouds.DETAIL.value(),
+                        (float) cloudDriftX, (float) cloudDriftZ, lightning),
+                new Float4(CausticaConfig.Rt.Clouds.JITTER.value(), stepX, stepZ, wet),
+                new Int4(steps, CLOUD_QUALITY_LIGHT_STEPS[quality], CLOUD_QUALITY_SCATTER_OCTAVES[quality],
+                        CLOUD_QUALITY_NOISE_OCTAVES[quality]),
+                skyExposed);
+    }
+
     /**
      * Derive the celestial light from Minecraft's time of day as typed values for {@link WorldPushData}.
      * Celestial angles come from the camera's {@link EnvironmentAttributeProbe} (partial-tick
@@ -1300,6 +1438,22 @@ public final class RtComposite {
             rg = 0.36f * moonPeak * moonStrength * trans[1];
             rb = 0.55f * moonPeak * moonStrength * trans[2];
             lightRadius = CausticaConfig.Rt.Composite.MOON_ANGULAR_RADIUS.value();
+        }
+        // The End: no atmosphere and no day cycle, so the sun is not merely dimmed there but absent, and the
+        // moon becomes the frame's only directional light — dull red and boosted, with the atmospheric
+        // transmittance skipped along with the air it describes.
+        if (level != null && level.dimension() == Level.END) {
+            float litFraction = 1.0f - Math.abs(moonPhase - 4.0f) / 4.0f; // 0 new .. 1 full
+            float moonPeak = 0.20f * (0.15f + 0.85f * litFraction) * END_MOON_BOOST;
+            lx = moonX; ly = moonY; lz = moonZ;
+            rr = moonPeak * END_MOON_COLOR_R;
+            rg = moonPeak * END_MOON_COLOR_G;
+            rb = moonPeak * END_MOON_COLOR_B;
+            lightRadius = CausticaConfig.Rt.Composite.MOON_ANGULAR_RADIUS.value();
+            dayFactor = 0f;
+            // The End's sky is stars at all hours. Minecraft's star ramp is a day/night curve for a sky that
+            // has a day, so this dimension pins the starfield at full brightness instead of following it.
+            starBrightness = 1f;
         }
         // Planar cloud shadows are evaluated from each shaded world point in the GPU NEE path.
         CelestialUv uv = celestialUv(moonPhase);

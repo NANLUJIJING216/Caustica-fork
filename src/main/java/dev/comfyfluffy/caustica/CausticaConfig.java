@@ -59,6 +59,7 @@ public final class CausticaConfig {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED,
+            Rt.Clouds.ENABLED, Rt.Clouds.QUALITY, Rt.Clouds.COVERAGE, Rt.Clouds.DETAIL,
             Rt.Composite.PLANAR_CLOUDS, Rt.Composite.CLOUD_QUALITY,
             Rt.Composite.CLOUD_COVERAGE, Rt.Composite.CLOUD_DENSITY, Rt.Composite.CLOUD_SPEED,
             Rt.Hdr.ENABLED, Ngx.PATH,
@@ -86,18 +87,65 @@ public final class CausticaConfig {
     private static void writeComments() {
         FILE.setComment("enabled",
                 " Caustica RT renderer configuration.\n"
-                        + " A matching -Dcaustica.* system property overrides the value below.");
+                        + " A matching -Dcaustica.* system property overrides the value below.\n"
+                        + " Caustica 光追渲染器配置；同名的 -Dcaustica.* 系统属性优先级更高，会覆盖下面的值。");
+        FILE.setComment("composite",
+                " Per-frame compositing and look: depth of field, parallax, sampling, water, fog, light\n"
+                        + " shafts and the volumetric cloud layer.\n"
+                        + " 逐帧合成与观感：景深、视差、采样、水、雾、体积光与体积云。");
+        FILE.setComment("clouds",
+                " Volumetric cloud layer (clouds.slang): a lit, ray-marched deck above the world that casts\n"
+                        + " on the ground below it and appears in reflections and refractions. quality is a\n"
+                        + " CEILING on steps and detail rather than an override - off switches the layer off, and\n"
+                        + " every other preset caps the settings underneath it.\n"
+                        + " 体积云：世界之上受光的步进云层，会在其下方的地面投下阴影，并出现在反射与折射中。\n"
+                        + " quality 是步数与细节的上限而非覆盖值：off 关闭云层，其余档位在其下各设置之上再取上限。");
+        FILE.setComment("clouds.enabled", " 主开关。Master switch for the layer.");
+        FILE.setComment("clouds.quality", " 质量档位：off / low / medium / high / ultra。Quality preset, in cap order.");
+        FILE.setComment("clouds.coverage", " 0.0-1.0，云层占据天空的比例。Sky fraction the deck fills.");
+        FILE.setComment("clouds.density", " 0.0-2.0，云的光学厚度倍率。Density scale on the layer's extinction.");
+        FILE.setComment("clouds.base-altitude",
+                " 云层底部的世界 Y 高度（方块，绝对坐标）。World Y of the deck's base, in absolute blocks.");
+        FILE.setComment("clouds.thickness", " 云层厚度（方块）。Deck thickness in blocks.");
+        FILE.setComment("clouds.detail", " 0.0-1.0，侵蚀场啃入云体的程度。How far erosion carves into the body.");
+        FILE.setComment("clouds.steps",
+                " 视线步进上限；质量档会在此基础上再取较小者。View-march step cap; the preset caps it further.");
+        FILE.setComment("clouds.wind-speed", " 云层水平漂移速度（方块/秒）。Horizontal drift speed of the deck.");
+        FILE.setComment("clouds.weather-response",
+                " 0.0-2.0，降雨与雷暴对云量、厚度和密度的影响强度。How hard weather drives the layer.");
+        FILE.setComment("clouds.lightning",
+                " 0.0-1.0，雷暴闪电从云层内部照亮云体的强度。Thunderstorm emission inside the deck.");
+        FILE.setComment("clouds.jitter",
+                " 0.0-1.0，步进起点的逐像素抖动，交给降噪器收敛。Per-ray march-start jitter.");
         FILE.setComment("terrain",
                 " Render-thread terrain work is bounded by dispatch/result counts per streaming pass.\n"
                         + " Buffer fill and BLAS/OMM preparation run on workers. max-inflight-sections bounds\n"
-                        + " the complete snapshot -> worker -> GPU build -> publication lifecycle.");
+                        + " the complete snapshot -> worker -> GPU build -> publication lifecycle.\n"
+                        + " 渲染线程的地形工作按每次流式处理的派发/结果数量限流；缓冲填充与 BLAS/OMM 准备在\n"
+                        + " 工作线程上进行，max-inflight-sections 限制 快照 -> 工作线程 -> GPU 构建 -> 发布 的完整生命周期。");
+        FILE.setComment("omm",
+                " Opacity micromaps: accelerate cutout foliage. subdivision is the micro-map resolution per axis.\n"
+                        + " 不透明度微图：加速镂空植被。subdivision 是每个轴的微图分辨率。");
+        FILE.setComment("entities",
+                " Entity and block-entity ray tracing: capacities, glow outlines, name tags and PBR textures.\n"
+                        + " 实体与方块实体光追：容量、描边发光、名牌与 PBR 贴图。");
+        FILE.setComment("particles",
+                " Particle ray tracing: camera-facing billboards that receive direct light.\n"
+                        + " 粒子光追：面向相机的公告板，接收直接光照。");
+        FILE.setComment("dlss-rr",
+                " DLSS Ray Reconstruction: denoises the ray-traced image. quality is the NGX perf-quality mode.\n"
+                        + " DLSS 光线重建：对光追图像降噪。quality 是 NGX 的性能/质量档位。");
         FILE.setComment("frame-generation",
                 " DLSS Frame Generation. Default off; gated additionally by hardware/driver availability.\n"
                         + " multi-frame-count: frames generated per rendered frame (1 = 2x, 2 = 3x, ...), clamped\n"
-                        + " at runtime to the driver's reported DLSSG.MultiFrameCountMax.");
+                        + " at runtime to the driver's reported DLSSG.MultiFrameCountMax.\n"
+                        + " DLSS 帧生成，默认关闭，并且还要求硬件/驱动支持。multi-frame-count 为每个渲染帧生成的\n"
+                        + " 帧数（1 = 2 倍，2 = 3 倍……），运行时受驱动报告的 DLSSG.MultiFrameCountMax 限制。");
         FILE.setComment("reflex",
                 " NVIDIA Reflex (VK_NV_low_latency2). Default off; gated additionally by device support.\n"
-                        + " minimum-interval-us: 0 = no framerate cap (Reflex just paces submission).");
+                        + " minimum-interval-us: 0 = no framerate cap (Reflex just paces submission).\n"
+                        + " NVIDIA Reflex，默认关闭，并且还要求设备支持。minimum-interval-us 为 0 表示不限制帧率，\n"
+                        + " 只让 Reflex 调节提交节奏。");
         FILE.setComment("lights",
                 " RIS direct lighting from block emitters (torches, glowstone, lava, ...): per diffuse\n"
                         + " vertex, resample ris-candidates power-weighted proposals and spend one shadow ray on\n"
@@ -105,11 +153,24 @@ public final class CausticaConfig {
                         + " hit, same as with no NEE). Power-weighted sampling and the local per-section light\n"
                         + " grid are always active whenever RIS is on. min-fill-ratio drops emissive footprints\n"
                         + " below that fraction of their bounding rectangle (speckle/sparse crossed planes), so\n"
-                        + " only reasonably compact glows become lights. stats/dump/dump-radius are debug logging.");
+                        + " only reasonably compact glows become lights. stats/dump/dump-radius are debug logging.\n"
+                        + " 方块光源（火把、萤石、岩浆等）的 RIS 直接光照：每个漫反射顶点按功率权重重采样\n"
+                        + " ris-candidates 个候选，并对存活者发一条阴影射线。ris-candidates = 0 完全关闭（光源只在\n"
+                        + " 直接命中时贡献，等同于没有 NEE）。RIS 开启时按功率采样与逐区块光源网格始终有效；\n"
+                        + " min-fill-ratio 会丢弃发光面积小于包围矩形该比例的稀疏面片，只有足够紧凑的发光体才会\n"
+                        + " 成为光源。stats/dump/dump-radius 是调试日志。");
+        FILE.setComment("exposure",
+                " Auto exposure: mode auto/manual, manual-ev in stops, key is the target middle grey.\n"
+                        + " 自动曝光：mode 为 auto/manual，manual-ev 以档为单位，key 是目标中灰。");
+        FILE.setComment("frame-stats",
+                " Per-stage GPU timing capture; off keeps the frame free of query overhead.\n"
+                        + " 逐阶段 GPU 计时采集；关闭可避免查询开销。");
         FILE.setComment("hdr",
                 " HDR display output (ST.2084/PQ). When enabled the swapchain is created in PQ automatically\n"
                         + " (falls back to SDR if the surface doesn't advertise it). paper-white-nits / peak-nits\n"
-                        + " drive the scene-HDR -> display mapping.");
+                        + " drive the scene-HDR -> display mapping.\n"
+                        + " HDR 显示输出（ST.2084/PQ）：开启后交换链自动以 PQ 创建（表面不支持时回退到 SDR），\n"
+                        + " paper-white-nits / peak-nits 决定场景 HDR 到显示器的映射。");
     }
 
     private static Path resolveConfigPath() {
@@ -612,6 +673,46 @@ public final class CausticaConfig {
                     finiteFloat("caustica.rt.jitterSignY", "composite.jitter-sign-y", -1.0f);
 
             private Composite() {
+            }
+        }
+
+        /**
+         * Volumetric cloud layer (clouds.slang). Ported from 0.1.0 together with the shader, so the toml
+         * keys, defaults and ranges are the ones that build shipped: a config file written for it keeps
+         * meaning the same thing here. The old {@code composite.planar-clouds} / {@code composite.cloud-*}
+         * keys are kept below for compatibility but no longer drive anything.
+         */
+        public static final class Clouds {
+            /** Quality presets in cap order. Index 0 is the off switch, and the arrays in RtComposite use
+             *  the same index, so the list order is load-bearing. */
+            public static final List<String> QUALITY_PRESETS = List.of("off", "low", "medium", "high", "ultra");
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.clouds", "clouds.enabled", true);
+            public static final StringSetting QUALITY =
+                    string("caustica.rt.cloudQuality", "clouds.quality", "medium",
+                            s -> QUALITY_PRESETS.contains(s) ? s : "medium");
+            public static final FloatSetting COVERAGE =
+                    clampedFloat("caustica.rt.cloudCoverage", "clouds.coverage", 0.35f, 0.0f, 1.0f);
+            public static final FloatSetting DENSITY =
+                    clampedFloat("caustica.rt.cloudDensity", "clouds.density", 0.35f, 0.0f, 2.0f);
+            public static final IntSetting BASE_ALTITUDE =
+                    clampedInt("caustica.rt.cloudBaseAltitude", "clouds.base-altitude", 320, -64, 4096);
+            public static final IntSetting THICKNESS =
+                    clampedInt("caustica.rt.cloudThickness", "clouds.thickness", 240, 0, 2048);
+            public static final FloatSetting DETAIL =
+                    clampedFloat("caustica.rt.cloudDetail", "clouds.detail", 0.45f, 0.0f, 1.0f);
+            public static final IntSetting STEPS =
+                    clampedInt("caustica.rt.cloudSteps", "clouds.steps", 32, 0, 256);
+            public static final FloatSetting WIND_SPEED =
+                    clampedFloat("caustica.rt.cloudWindSpeed", "clouds.wind-speed", 6.0f, 0.0f, 64.0f);
+            public static final FloatSetting WEATHER_RESPONSE =
+                    clampedFloat("caustica.rt.cloudWeatherResponse", "clouds.weather-response", 1.0f, 0.0f, 2.0f);
+            public static final FloatSetting LIGHTNING =
+                    clampedFloat("caustica.rt.cloudLightning", "clouds.lightning", 0.9f, 0.0f, 1.0f);
+            public static final FloatSetting JITTER =
+                    clampedFloat("caustica.rt.cloudJitter", "clouds.jitter", 0.5f, 0.0f, 1.0f);
+
+            private Clouds() {
             }
         }
 

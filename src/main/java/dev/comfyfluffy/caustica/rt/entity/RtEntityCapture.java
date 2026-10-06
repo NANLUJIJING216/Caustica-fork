@@ -49,6 +49,11 @@ public final class RtEntityCapture implements VertexConsumer {
     int currentAlphaBucket = RtAccel.ENTITY_BUCKET_ANY_HIT;
     int currentFlags;
     float currentAux0;
+    // Red damage-flash blend weight for the geometry being submitted, set by the collector per submitModel
+    // from the packed overlay coordinate (see RtEntityCollector#redOverlayWeight). aux0 is already taken by
+    // the alpha and rain-splash lanes an any-hit multiplies into cutout coverage, so the flash rides aux1,
+    // which nothing else reads. Stored per-prim; world.rchit's entity path blends the albedo with it.
+    float currentAux1;
     // Decal-stacking rank for the current submission (0 = no offset). Set by the collector from
     // SubmitNodeCollector#order(int) — see emitQuad's coincident-layer push.
     int currentOrder;
@@ -87,6 +92,7 @@ public final class RtEntityCapture implements VertexConsumer {
         currentAlphaBucket = RtAccel.ENTITY_BUCKET_ANY_HIT;
         currentFlags = 0;
         currentAux0 = 0.0f;
+        currentAux1 = 0.0f;
         currentOrder = 0;
         uvRemap = false;
     }
@@ -406,7 +412,7 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(Float.intBitsToFloat(currentMaterialId));
             prim.add(Float.intBitsToFloat(currentFlags));
             prim.add(currentAux0);
-            prim.add(0f); // aux1
+            prim.add(currentAux1); // aux1: red damage-flash weight (see world.rchit's entity path)
             alphaBuckets.add(currentAlphaBucket);
         }
     }

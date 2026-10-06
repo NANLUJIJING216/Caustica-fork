@@ -47,9 +47,9 @@ public struct WorldPush {
     public float3   camDelta;
     public uint     spp;
     public float2   jitter;
-    public uint     flags;            // bit0 submerged, bit4 waves, bit5 water fog, bit6 air fog, bit7 shafts;
-                                     // bit8 POM, bit9 planar clouds, bits10..11 cloud detail quality;
-                                     // bits16..23 POM depth, bits24..31 cloud density percent
+    public uint     flags;            // bit0 submerged, bit2 End sky, bit4 waves, bit5 water fog, bit6 air fog,
+                                     // bit7 shafts, bit8 POM, bit9 planar clouds, bits10..11 cloud detail
+                                     // quality; bits16..23 POM depth, bits24..31 cloud density percent
     public uint     maxBounces;
     public float4   sunDir;           // xyz true sun direction, w dayFactor 0..1
     public float4   lightDir;         // xyz active NEE light dir, w square half-angle (rad)
@@ -62,7 +62,7 @@ public struct WorldPush {
     public float4   weatherColor;     // linear weather fog RGB, cloud layer height
     // Full terrain-rebase X/Z in xy. Adding rebased ray coordinates restores a continuous world cloud
     // domain; float precision becomes coarse only beyond the usual ~16-million-block exact-int range.
-    public float4   cloudAnchor;      // xy world X/Z rebase, z cloud coverage 0..2, w cloud speed 0..2
+    public float4   cloudAnchor;      // xyz world rebase origin (blocks), w skyExposed 0/1
     public float4   cloudTuning;      // x active layers 1..2, y sampling budget 8..64 (light probes), z air-fog scale (weather x time of day)
     public float4   airVolume;        // base density, height falloff, rebased base height, max distance
     public float4   waterParams;      // xyz camera-biome water tint, w wave time (s)
@@ -76,7 +76,31 @@ public struct WorldPush {
     public int4     lightGridDims;       // xyz dense grid dimensions, w reserved
     public uint     lightCount;       // packed Light records in pc.lightBufAddr
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
+
+    // ---- Volumetric cloud layer (clouds.slang).
+    //
+    // Four 16-byte lanes rather than a dozen named scalars: the stages read them once per ray and the
+    // packing keeps the struct's tail at one cache line. The CPU resolves the quality preset into a step
+    // budget and an erosion scale, so nothing below branches on the preset itself.
+    //
+    // Cloud geometry is expressed in BLOCKS, the same space as the ray origins, and the layer spans
+    // [cloudA.z, cloudA.z + cloudA.w]. A w of zero switches the layer off, which is what the "off"
+    // preset publishes - there is no separate enable lane to keep in sync with the geometry.
+    public float4   cloudA;           // x coverage 0..1, y density scale, z base altitude, w thickness
+    public float4   cloudB;           // x erosion 0..1, y wind offset X, z wind offset Z, w lightning scale
+    public float4   cloudC;           // x first-sample jitter 0..1, yz wind drift per frame (blocks), w rain level 0..1
+    // x view march steps, y light march steps, z multi-scatter octaves, w noise octaves.
+    public uint4    cloudD;
 };
+
+// WorldPush.flags bit 2: this frame is rendered in the End.
+//
+// The End is not "the overworld at night". It has no atmosphere to scatter, no day cycle and no weather, so
+// its sky is a starfield over the dimension's own faint violet glow (see END_SKY_GLOW in sky.slang), its
+// only directional light is a dull red moon (see END_MOON_COLOR), and the medium filling it is not
+// precipitation. Published as one verdict so the miss shader, the haze and the wet film all read the same
+// answer instead of three copies of a dimension check.
+public static const uint WORLD_FLAG_END_SKY = 4u;
 
 // 32-byte hot area-light record. Radiance uses packed R11G11B10 and the grid-relative owner section
 // uses three unsigned 10-bit coordinates; the geometric normal is reconstructed from the half axes.

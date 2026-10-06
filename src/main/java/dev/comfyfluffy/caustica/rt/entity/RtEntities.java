@@ -1019,6 +1019,9 @@ public final class RtEntities {
                     boolean rainSplash = rainActive && p instanceof WaterDropParticle;
                     capture.currentFlags = rainSplash ? WEATHER_ALPHA_FLAG | RAIN_SPLASH_FLAG : 0;
                     capture.currentAux0 = rainSplash ? 0.30f : 0.0f;
+                    // Particles never carry the entity damage flash: clear the lane the entity collector owns
+                    // so a mob hit earlier this frame cannot tint the weather.
+                    capture.currentAux1 = 0.0f;
                     capture.currentMaterialId = rainSplash ? rainSplashMaterialId : 0;
                     int vb = capture.verts.size(), ib = capture.idx.size();
                     int ub = capture.uvList.size(), prb = capture.prim.size(), abb = capture.alphaBuckets.size();
@@ -1101,6 +1104,8 @@ public final class RtEntities {
             }
             List<RtWeatherSnapshot.Vertex> vertices = quad.vertices();
             capture.currentAux0 = vertices.getFirst().alpha();
+            // Weather geometry carries no entity damage flash; clear the collector-owned lane too.
+            capture.currentAux1 = 0.0f;
             for (RtWeatherSnapshot.Vertex vertex : vertices) {
                 int block = vertex.lightCoords() & 0xFFFF;
                 int sky = (vertex.lightCoords() >>> 16) & 0xFFFF;

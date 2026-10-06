@@ -6,11 +6,15 @@ import world_common;
 import world_core;
 import math;
 import trace;
-import cloud_volume;
+import clouds;
 
 public struct AirVolumeResult {
     public float3 transmittance;
     public float3 radiance;
+    // Representative scattering distance for DLSS-RR, or < 0 when this segment scattered nothing. A miss
+    // reports no surface, so without this the haze is reprojected against the sky's far plane — a depth
+    // that rotates with the camera but never translates — and its sample noise cannot converge.
+    public float depth;
 };
 
 public static const uint AIR_VOLUME_SLICE_COUNT = 4u;
@@ -47,6 +51,13 @@ public AirVolumeResult integrateAirVolume(float3 ro, float3 rd, float distance, 
     AirVolumeResult result;
     result.transmittance = float3(1.0, 1.0, 1.0);
     result.radiance = float3(0.0, 0.0, 0.0);
+    result.depth = -1.0;
+    // The End has no air to fog and no shafts to cast: its medium is the violet haze that world.rmiss
+    // composites from rainfog.slang. Returning the identity here keeps the two from stacking, and keeps
+    // that dimension reading as the 0.1.0 sky rather than as this renderer's air.
+    if ((worldPush.flags & WORLD_FLAG_END_SKY) != 0u) {
+        return result;
+    }
     bool fogEnabled = (worldPush.flags & (1u << 6u)) != 0u;
     bool shaftsEnabled = sampleShafts && (worldPush.flags & (1u << 7u)) != 0u;
     if (!fogEnabled && !shaftsEnabled) {
@@ -77,6 +88,16 @@ public AirVolumeResult integrateAirVolume(float3 ro, float3 rd, float distance, 
         float ambientLightningLift = 1.0 + 0.35 * clamp(worldPush.weather.z, 0.0, 1.0);
         result.radiance = fogColor * (1.0 - transmittance)
                 * (AIR_VOLUME_AMBIENT * ambientLightningLift);
+        // Representative depth of this term, analytically. For a medium of uniform extinction along the
+        // segment the scattering-weighted mean distance is d * (1 - (1 + od) e^-od) / (od * (1 - e^-od)),
+        // which tends to d/2 as the air thins and to 1/sigma as it thickens. A handful of ALU and no extra
+        // rays, and it is what lets DLSS-RR reproject the haze with the right parallax.
+        float fogWeight = 1.0 - transmittance;
+        if (fogWeight > 1.0e-4) {
+            float meanFactor = (1.0 - (1.0 + opticalDepth) * transmittance)
+                    / max(opticalDepth * fogWeight, 1.0e-6);
+            result.depth = meanFactor * safeDistance;
+        }
     }
 
     float3 rawLightDir = worldPush.lightDir.xyz;
@@ -94,7 +115,11 @@ public AirVolumeResult integrateAirVolume(float3 ro, float3 rd, float distance, 
     // the shafts do not, so they stand out *more* under a cloud shadow than in clear weather. That is
     // the glowing haze that survives turning ambient fog off, because that switch only gates the
     // analytic fog term above and leaves these shafts running.
-    float cloudShade = cloudSunTransmittance(worldPush, ro, lightDir);
+    // The volumetric deck's own transmittance toward the light, from the same density field the surface
+    // NEE multiplies in — one cloud, one shadow.
+    CloudLayer cloudDeck = cloudLayer(worldPush);
+    float3 cloudShadeRgb = cloudShadowTransmittance(ro, lightDir, 10000.0, cloudDeck);
+    float cloudShade = dot(cloudShadeRgb, float3(0.2126, 0.7152, 0.0722));
     if (cloudShade <= 0.001) {
         return result;
     }
@@ -109,6 +134,8 @@ public AirVolumeResult integrateAirVolume(float3 ro, float3 rd, float distance, 
     float scatterShare = 2.0 / (1.0 + absorption) * (0.35 + 0.65 * fogGain);
     float shaftDensity = AIR_VOLUME_SHAFT_DENSITY * densityScale;
     float shaftDistance = min(safeDistance, AIR_VOLUME_SHAFT_DISTANCE);
+    float depthWeightSum = 0.0;
+    float depthWeightedSum = 0.0;
     for (uint slice = 0u; slice < AIR_VOLUME_SLICE_COUNT; ++slice) {
         uint jitterSeed = seed ^ worldPush.frameIndex * 747796405u ^ slice * 2891336453u;
         // Quadratic strata spend the same four visibility rays near the camera, where trees
@@ -126,9 +153,17 @@ public AirVolumeResult integrateAirVolume(float3 ro, float3 rd, float distance, 
         float sliceScattered = 1.0 - exp(-sliceOpticalDepth);
         float3 samplePosition = ro + rd * sampleDistance;
         VisibilityResult shadow = visibility(samplePosition, lightDir, 10000.0);
-        result.radiance += exp(-opticalBefore * absorption) * sliceScattered * fogColor
+        float shaftWeight = exp(-opticalBefore * absorption) * sliceScattered;
+        result.radiance += shaftWeight * fogColor
                 * normalizedLight * (AIR_VOLUME_DIRECTIONAL * phase * scatterShare)
                 * clamp(shadow.transmittance, 0.0, 1.0);
+        depthWeightedSum += sampleDistance * shaftWeight;
+        depthWeightSum += shaftWeight;
+    }
+    if (depthWeightSum > 1.0e-5) {
+        // The shafts reach further than the analytic haze, and the further of the two contributions is the
+        // safer guide: under-reporting parallax is exactly what leaves the sample lattice on screen.
+        result.depth = max(result.depth, depthWeightedSum / depthWeightSum);
     }
     return result;
 }

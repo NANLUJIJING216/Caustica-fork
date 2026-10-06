@@ -369,6 +369,17 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         MaterialHeader header = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
         uint material = header.model;
         float3 baseAlbedo = srgbToLinear(entityTexel.rgb) * pr.tint.rgb;
+        // Red damage flash. Vanilla resolves it in the entity fragment shader as
+        // mix(overlayColor.rgb, color.rgb, overlayColor.a) with the overlay texture's red row, which the CPU
+        // capture has already collapsed into the 0..0.3 blend weight carried by the prim record's spare lane
+        // (aux1 — aux0 holds the alpha and rain-splash lanes an any-hit multiplies into cutout coverage), and
+        // the ray tracer samples no overlay texture of its own. Blending the albedo toward red keeps the
+        // flash inside the path tracer's light transport, so a mob that has just been hit flickers red under
+        // whatever light it is standing in rather than being painted over the finished frame.
+        float damage = asfloat(pr.aux1);
+        if (damage > 0.0) {
+            baseAlbedo = lerp(baseAlbedo, float3(1.0, 0.0, 0.0), saturate(damage));
+        }
         float3 albedo = material == MATERIAL_DIELECTRIC
                 ? lerp(float3(1.0, 1.0, 1.0), baseAlbedo, entityTexel.a) : baseAlbedo;
         Surface surface = evaluateMaterial(header, euvCoord, entityLod, albedo, n,

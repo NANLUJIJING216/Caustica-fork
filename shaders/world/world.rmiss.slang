@@ -9,7 +9,9 @@
 // disc isn't double-counted against the direct light → fireflies). The atmosphere gradient + stars are
 // added on every miss (any bounce): stars aren't a NEE light, so they never double-count.
 import world_common;
-import cloud_volume;
+import sky;
+import clouds;
+import rainfog;
 
 [[vk::push_constant]] WorldPushConstants pc;
 
@@ -17,7 +19,6 @@ import cloud_volume;
 // LOD (no derivatives in a miss shader). The sun/moon discs are drawn from its real texels.
 [[vk::binding(9, 0)]] Sampler2D celestialsAtlas;
 
-static const float PI = 3.14159265359;
 float pow2(float x) { return x * x; }
 
 // Near-white top-of-atmosphere disc radiances: the visible warm/red tint comes from multiplying by
@@ -36,115 +37,9 @@ static const float WEATHER_MIN_TRANSMITTANCE = 0.10;
 // distance 100 → half-angle = atan(0.30) / atan(0.20). Decoupled from the NEE light radius (≈0.6°).
 static const float SUN_DISC_HALF_ANGLE  = 0.29146; // atan(30/100), vanilla sun size
 static const float MOON_DISC_HALF_ANGLE = 0.19740; // atan(20/100), vanilla moon size
-// Faint night-sky ambient so the night isn't pure black where the atmosphere in-scatter falls to zero.
-static const float3 NIGHT_ZENITH  = float3(0.004, 0.008, 0.022) / 5.0;
-static const float3 NIGHT_HORIZON = float3(0.015, 0.022, 0.045) / 5.0;
 
-// ---- Physically-based atmosphere (Nishita / O'Neil single scattering + ozone absorption). A view ray
-// is marched through the atmospheric shell; at each step the transmittance toward the sun is integrated
-// (a second, shorter march), giving Rayleigh (blue-sky / red-sunset) + Mie (sun halo) in-scattered
-// radiance. World up = +Y; the camera sits a couple km above a spherical planet. Output is HDR in the
-// same units as tracePath.
-static const float  PLANET_R   = 6371000.0;
-static const float  ATMOS_R    = 6471000.0;        // 100 km shell
-static const float3 RAY_BETA   = float3(5.5e-6, 13.0e-6, 22.4e-6); // Rayleigh scattering at sea level
-static const float  MIE_BETA   = 21.0e-6;          // Mie scattering at sea level
-static const float  RAY_SCALE_H = 8000.0;          // Rayleigh density scale height
-static const float  MIE_SCALE_H = 1200.0;          // Mie density scale height
-static const float  MIE_G      = 0.758;            // Mie anisotropy (forward-scattering)
-// Ozone: absorption only (no scattering), tent-shaped density peaking at 25 km. Its green-heavy
-// absorption keeps the zenith deep blue at noon and turns twilight purple-orange.
-static const float3 OZONE_BETA = float3(0.650e-6, 1.881e-6, 0.085e-6);
-static const float  OZONE_CENTER_H = 25000.0;
-static const float  OZONE_WIDTH_H  = 15000.0;
-static const float  SUN_INTENSITY = 22.0;
-static const int    ATMOS_PRIMARY_STEPS = 16;
-static const int    ATMOS_LIGHT_STEPS   = 8;
 
-float ozoneDensity(float h) { return max(0.0, 1.0 - abs(h - OZONE_CENTER_H) / OZONE_WIDTH_H); }
 
-// Smaller root of ray vs sphere of radius r centred at origin (no-hit handled by x > y).
-float2 raySphere(float3 o, float3 d, float r) {
-    float b = dot(o, d);
-    float c = dot(o, o) - r * r;
-    float disc = b * b - c;
-    if (disc < 0.0) return float2(1.0e9, -1.0e9);
-    disc = sqrt(disc);
-    return float2(-b - disc, -b + disc);
-}
-
-float3 atmosphere(float3 dir, float3 sunDir) {
-    float3 orig = float3(0.0, PLANET_R + 2000.0, 0.0);
-    float2 t = raySphere(orig, dir, ATMOS_R);
-    if (t.x > t.y) return float3(0.0, 0.0, 0.0);      // ray misses the atmosphere entirely
-    float tStart = max(t.x, 0.0);
-    float tEnd = t.y;
-    float2 tGround = raySphere(orig, dir, PLANET_R);
-    if (tGround.x > 0.0) tEnd = min(tEnd, tGround.x); // clip the march at the planet surface
-    float segLen = (tEnd - tStart) / float(ATMOS_PRIMARY_STEPS);
-
-    float mu = dot(dir, sunDir);
-    float phaseR = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
-    float g = MIE_G;
-    float phaseM = 3.0 / (8.0 * PI) * ((1.0 - g * g) * (1.0 + mu * mu))
-                 / ((2.0 + g * g) * pow(max(1.0 + g * g - 2.0 * g * mu, 0.0), 1.5));
-
-    float3 sumR = float3(0.0, 0.0, 0.0), sumM = float3(0.0, 0.0, 0.0);
-    float odR = 0.0, odM = 0.0, odO = 0.0;            // view-ray optical depth accumulators
-    float tCur = tStart;
-    for (int i = 0; i < ATMOS_PRIMARY_STEPS; i++) {
-        float3 p = orig + dir * (tCur + segLen * 0.5);
-        float h = length(p) - PLANET_R;
-        float hr = exp(-h / RAY_SCALE_H) * segLen;
-        float hm = exp(-h / MIE_SCALE_H) * segLen;
-        odR += hr; odM += hm; odO += ozoneDensity(h) * segLen;
-
-        // March toward the sun to accumulate the light-ray optical depth (transmittance to space).
-        float2 tl = raySphere(p, sunDir, ATMOS_R);
-        float segLenL = tl.y / float(ATMOS_LIGHT_STEPS);
-        float tlCur = 0.0, odRL = 0.0, odML = 0.0, odOL = 0.0;
-        bool blocked = false;
-        for (int j = 0; j < ATMOS_LIGHT_STEPS; j++) {
-            float3 pl = p + sunDir * (tlCur + segLenL * 0.5);
-            float hl = length(pl) - PLANET_R;
-            if (hl < 0.0) { blocked = true; break; } // sun is below this point's horizon → in shadow
-            odRL += exp(-hl / RAY_SCALE_H) * segLenL;
-            odML += exp(-hl / MIE_SCALE_H) * segLenL;
-            odOL += ozoneDensity(hl) * segLenL;
-            tlCur += segLenL;
-        }
-        if (!blocked) {
-            float3 tau = RAY_BETA * (odR + odRL) + MIE_BETA * 1.1 * (odM + odML)
-                       + OZONE_BETA * (odO + odOL);
-            float3 atten = exp(-tau);
-            sumR += hr * atten;
-            sumM += hm * atten;
-        }
-        tCur += segLen;
-    }
-    return SUN_INTENSITY * (sumR * RAY_BETA * phaseR + sumM * MIE_BETA * phaseM);
-}
-
-// Extinction from the camera to space along `dir` (Rayleigh + Mie + ozone; the sun-below-horizon case
-// needs no explicit planet test — a grazing/downward path picks up enormous optical depth, so the
-// transmittance rolls to zero smoothly on its own). Tints the sun/moon discs at draw time, and is ported
-// verbatim to RtComposite.writeSky so the NEE sunlight on terrain follows the identical sunset curve —
-// the disc, the sky, and the light can never disagree.
-float3 transmittanceToSpace(float3 dir) {
-    float3 orig = float3(0.0, PLANET_R + 2000.0, 0.0);
-    float2 t = raySphere(orig, dir, ATMOS_R);
-    if (t.y <= 0.0) return float3(1.0, 1.0, 1.0);
-    float segLen = t.y / float(ATMOS_LIGHT_STEPS);
-    float odR = 0.0, odM = 0.0, odO = 0.0;
-    for (int i = 0; i < ATMOS_LIGHT_STEPS; i++) {
-        float3 p = orig + dir * (segLen * (float(i) + 0.5));
-        float h = length(p) - PLANET_R;
-        odR += exp(-h / RAY_SCALE_H) * segLen;
-        odM += exp(-h / MIE_SCALE_H) * segLen;
-        odO += ozoneDensity(h) * segLen;
-    }
-    return exp(-(RAY_BETA * odR + MIE_BETA * 1.1 * odM + OZONE_BETA * odO));
-}
 
 // Build the celestial body's square tangent frame: `right` along the arc-travel direction, `up`
 // perpendicular within the sky. Shared by the visible disc and the NEE square sampling in raygen.
@@ -224,11 +119,6 @@ float3 stars(float3 dir, float starBrightness, float VdotS, float4 celestial) {
     return 0.2 * star * starCol * starBrightness;
 }
 
-struct WeatherCloudResult {
-    float transmittance;
-    float3 radiance;
-};
-
 float cloudDirectTransmittance(float rain, float thunder) {
     return clamp(1.0 - rain * WEATHER_RAIN_ATTENUATION - thunder * WEATHER_THUNDER_ATTENUATION,
                  WEATHER_MIN_TRANSMITTANCE, 1.0);
@@ -241,19 +131,6 @@ float weatherSkyFactor(float4 weather) {
     float lightning = weather.y * smoothstep(0.78, 1.0, weather.z);
     return clamp(direct + lightning * (1.0 - direct) * 0.80,
                  WEATHER_MIN_TRANSMITTANCE, 1.0);
-}
-
-WeatherCloudResult weatherCloud(WorldPush worldPush, float3 rayOrigin, float3 dir, float weatherSky) {
-    WeatherCloudResult result;
-    result.transmittance = 1.0;
-    result.radiance = float3(0.0, 0.0, 0.0);
-    if ((worldPush.flags & (1u << 9u)) != 0u) {
-        VolumeCloudResult volume = integrateVolumetricCloud(
-                worldPush, rayOrigin, dir, CLOUD_FAR, weatherSky);
-        result.transmittance = volume.transmittance;
-        result.radiance = volume.radiance;
-    }
-    return result;
 }
 
 [shader("miss")]
@@ -269,6 +146,10 @@ void main(inout Payload payload) {
     float weatherSky = weatherSkyFactor(worldPush.weather);
     float weatherDirect = 1.0;
     bool showCelestial = (payload.flags & PAYLOAD_SHOW_CELESTIAL) != 0u;
+    // The End: no atmosphere to scatter, no day cycle, no weather. Every branch below that would shade the
+    // sky with air is gated on this one verdict rather than on its own dimension test (see the flag's note
+    // in world_common.slang).
+    bool endSky = (worldPush.flags & WORLD_FLAG_END_SKY) != 0u;
 
     // Physically-based in-scattering: blue zenith, bright/desaturated horizon, warm Mie halo + red
     // sunset all fall out of the Rayleigh/Mie/ozone march. At night the sun is below the horizon so the
@@ -286,15 +167,22 @@ void main(inout Payload payload) {
         mdir = fl > 1.0e-4 ? float3(flat2.x / fl, 0.0, flat2.y / fl) : float3(1.0, 0.0, 0.0);
         downFade = exp(dir.y * 3.0);
     }
-    float3 col = atmosphere(mdir, sd);
-    // Luminance-preserving vibrance on the in-scatter only (see SKY_SATURATION).
-    float lum = dot(col, float3(0.2126, 0.7152, 0.0722));
-    col = max(lerp(float3(lum, lum, lum), col, SKY_SATURATION), float3(0.0, 0.0, 0.0));
-    float up = clamp(dir.y, 0.0, 1.0);
-    float3 nightAmbient = lerp(NIGHT_HORIZON, NIGHT_ZENITH, up);
-    col += nightAmbient * (1.0 - day);
-    col *= downFade;
-    col *= weatherSky;
+    // ---- Sky.
+    //
+    // The End has no atmosphere, so it has no in-scatter, no airglow floor and no day cycle: its sky is the
+    // dimension's own faint violet wash with the starfield over it. The down-fade and the weather dimming
+    // are atmosphere effects and are skipped with it.
+    float3 col = endSky ? END_SKY_GLOW : atmosphere(mdir, sd);
+    if (!endSky) {
+        // Luminance-preserving vibrance on the in-scatter only (see SKY_SATURATION).
+        float lum = dot(col, float3(0.2126, 0.7152, 0.0722));
+        col = max(lerp(float3(lum, lum, lum), col, SKY_SATURATION), float3(0.0, 0.0, 0.0));
+        float up = clamp(dir.y, 0.0, 1.0);
+        float3 nightAmbient = lerp(NIGHT_HORIZON, NIGHT_ZENITH, up);
+        col += nightAmbient * (1.0 - day);
+        col *= downFade;
+        col *= weatherSky;
+    }
     col += stars(dir, starBrightness, VdotS, worldPush.celestial) * weatherDirect;
 
     // Sun & moon discs — sampled from the vanilla celestials atlas, gated to rays that haven't already
@@ -303,37 +191,111 @@ void main(inout Payload payload) {
     float3 celestialRadiance = float3(0.0, 0.0, 0.0);
     if (showCelestial) {
         float2 local;
-        squareBody(dir, sd, SUN_DISC_HALF_ANGLE, worldPush.celestial.xyz, local);
-        if (all(abs(local) < float2(1.0, 1.0))) {
-            float2 uv = lerp(worldPush.sunUv.xy, worldPush.sunUv.zw, local * 0.5 + 0.5);
-            float3 t = celestialsAtlas.SampleLevel(uv, 0.0).rgb;
-            // The vanilla sun sprite bakes a soft glow gradient into its texels; scaling that raw to HDR
-            // makes a huge ring. Raise the texture luminance to a high power — only the bright core
-            // survives, the halo collapses to ~0.
-            float core = pow(clamp(dot(t, t) * 0.45, 0.0, 1.0), 6.0);
-            // transmittanceToSpace reddens+dims the disc through the sunset on the sky's own curve.
-            celestialRadiance += SUN_DISC_RADIANCE * transmittanceToSpace(dir) * core * sunUp * weatherDirect;
+        // No sun in the End: the frame's directional light there is the moon, and drawing a body that
+        // delivers no light would be a lie the path integral cannot cancel.
+        if (!endSky) {
+            squareBody(dir, sd, SUN_DISC_HALF_ANGLE, worldPush.celestial.xyz, local);
+            if (all(abs(local) < float2(1.0, 1.0))) {
+                float2 uv = lerp(worldPush.sunUv.xy, worldPush.sunUv.zw, local * 0.5 + 0.5);
+                float3 t = celestialsAtlas.SampleLevel(uv, 0.0).rgb;
+                // The vanilla sun sprite bakes a soft glow gradient into its texels; scaling that raw to HDR
+                // makes a huge ring. Raise the texture luminance to a high power — only the bright core
+                // survives, the halo collapses to ~0.
+                float core = pow(clamp(dot(t, t) * 0.45, 0.0, 1.0), 6.0);
+                // transmittanceToSpace reddens+dims the disc through the sunset on the sky's own curve.
+                celestialRadiance += SUN_DISC_RADIANCE * transmittanceToSpace(dir) * core * sunUp * weatherDirect;
+            }
         }
         // Same horizon gate as the sun: with the soft-horizon change, below-horizon rays no longer clip
-        // at the planet, so without this the moon disc would stay visible after it set.
+        // at the planet, so without this the moon disc would stay visible after it set. The End has neither
+        // air nor a horizon curve, so its moon is drawn ungated.
         float moonUp = clamp((worldPush.moonDir.y + 0.0625) / 0.125, 0.0, 1.0);
         squareBody(dir, worldPush.moonDir.xyz, MOON_DISC_HALF_ANGLE, worldPush.celestial.xyz, local);
-        if (all(abs(local) < float2(1.0, 1.0)) && moonUp > 0.0) {
+        if (all(abs(local) < float2(1.0, 1.0)) && (endSky || moonUp > 0.0)) {
             float2 uv = lerp(worldPush.moonUv.xy, worldPush.moonUv.zw, local * 0.5 + 0.5);
             float3 t = celestialsAtlas.SampleLevel(uv, 0.0).rgb;
             // Moon: a smoothstep contrast ramp suppresses the faint halo while keeping the lit phase
             // shape from the texture. The transmittance tint gives a warm amber moon at moonrise/set.
             float m = smoothstep(0.0, 1.0, min(length(t), 1.0)) * 1.3;
-            celestialRadiance += MOON_DISC_RADIANCE * transmittanceToSpace(dir) * t * m * pow2(1.0 - day) * moonUp * weatherDirect;
+            // The End's moon is its only light there: dull red (END_MOON_COLOR) and boosted, and drawn
+            // without the atmospheric tint or the horizon gate — neither of which exists in that dimension.
+            // Tinting the disc and the light NEE samples by the same colour is what keeps the ground and
+            // the haze red too, instead of a red disc over grey light.
+            float3 moonDisc = endSky
+                    ? MOON_DISC_RADIANCE * END_MOON_BOOST * END_MOON_COLOR * t * m
+                    : MOON_DISC_RADIANCE * transmittanceToSpace(dir) * t * m * pow2(1.0 - day) * moonUp;
+            celestialRadiance += moonDisc * weatherDirect;
         }
     }
 
-    WeatherCloudResult cloud = weatherCloud(worldPush, WorldRayOrigin(), dir, weatherSky);
-    // The HDR discs need a longer optical path through dense cloud than the diffuse sky. A single
-    // transmittance still leaves the sun white after tone mapping when rain clouds cover its direction.
-    float discTransmittance = cloud.transmittance * cloud.transmittance;
-    discTransmittance *= discTransmittance;
-    col = col * cloud.transmittance + cloud.radiance + celestialRadiance * discTransmittance;
+    // ---- Volumetric clouds (clouds.slang).
+    //
+    // Marched here, on every radiance ray that reaches the sky, so the primary view and every
+    // reflection/refraction bounce integrate the same layer with no second implementation and no
+    // separate pass to keep in sync. The layer is lit by the same dominant celestial light terrain NEE
+    // uses (worldPush.lightDir / lightRadiance) and by the sky this miss already sampled, so cloud light
+    // and terrain light cannot diverge.
+    //
+    // The layer is deliberately left noisy and handed to DLSS Ray Reconstruction, which resolves it
+    // against the ray-traced geometry; pre-smoothing it here would cost detail the denoiser could have
+    // recovered.
+    // The layer's representative depth for DLSS-RR, published through the miss-side rayCone lane below (a
+    // miss has no ray cone of its own to report). Negative means this ray saw no cloud.
+    float cloudDepth = CLOUD_NO_HIT_DEPTH;
+    CloudLayer cloudDeck = cloudLayer(worldPush);
+    if (cloudLayerActive(cloudDeck)) {
+        float jitter = cloudJitter(cloudDeck, float2(DispatchRaysIndex().xy), worldPush.frameIndex);
+        // What lights the layer from every side is the sky above it, not the sky the camera happens to
+        // be looking along. Sampling the view direction instead makes a cloud's underside exactly as
+        // dark as the horizon behind it, which is where black cloud bottoms come from.
+        float3 cloudAmbient = atmosphere(float3(0.0, 1.0, 0.0), sd) * weatherSky;
+        float3 skyOnly = col + celestialRadiance;
+        CloudResult cloud = marchClouds(WorldRayOrigin(), dir, 1.0e6, cloudDeck,
+                worldPush.lightDir.xyz, max(worldPush.lightRadiance.xyz, float3(0.0, 0.0, 0.0)),
+                cloudAmbient, jitter);
+        cloudDepth = cloud.depth;
+        // Energy: what the layer scatters toward the viewer, plus what it transmits of the sky behind it.
+        col = col * cloud.transmittance + cloud.scattering;
+        // Thunderstorm emission from inside the layer. The CPU only publishes a non-zero scale while the
+        // level's thunder is up, so this needs no weather state of its own here.
+        col += cloudDeck.lightning * cloud.scattering;
+        // The HDR discs need a longer optical path through dense cloud than the diffuse sky: they are
+        // attenuated by the layer once more than the sky they sit in.
+        celestialRadiance *= cloud.transmittance;
+        // Aerial perspective: cloud seen through kilometres of atmosphere loses its contrast to the sky
+        // behind it. The layer's own representative depth drives it, so the effect grows exactly with the
+        // long grazing path that otherwise stacks distant cloud into a solid band.
+        if (cloud.depth > 0.0) {
+            float aerial = 1.0 - exp(-cloud.depth * CLOUD_AERIAL_PER_BLOCK);
+            col = lerp(col, skyOnly, aerial);
+        }
+    }
+    col += celestialRadiance;
+
+    // ---- The End's haze (rainfog.slang).
+    //
+    // ONLY the End composites this medium. The overworld and the Nether use this renderer's own air fog and
+    // light shafts (air_volume.slang) exclusively — the rain fog that 0.1.0 put in the air below the deck
+    // has been removed there, so the two media can never stack. The End keeps it because that dimension has
+    // no atmosphere for air_volume to fog, and because its medium is not precipitation: the strength rides
+    // the cloud layer's rain lane, which the CPU fills with the dimension's own haze value.
+    //
+    // It composites over the finished sky — clouds, discs and stars included — for the same reason the cloud
+    // layer does: from inside the medium, everything behind it is veiled by it.
+    //
+    // The depth DLSS-RR reprojects this pixel by: the cloud layer's centroid if the ray crossed one, else
+    // the haze's. A miss has no surface, and an infinite depth is only correct for the sky itself.
+    float guideDepth = cloudDepth;
+    if (endSky && rainFogStrength(worldPush, cloudDeck) > 0.0) {
+        RainFog fog = makeRainFog(worldPush, cloudDeck, DispatchRaysIndex().xy);
+        CloudResult fogSample = marchRainFog(WorldRayOrigin(), dir, 10000.0, fog);
+        col = fogSample.scattering + col * fogSample.transmittance;
+        // Both are participating media, so where both are present the nearer one dominates the pixel's
+        // parallax and is the depth the denoiser can actually use.
+        if (fogSample.depth > 0.0) {
+            guideDepth = guideDepth > 0.0 ? min(guideDepth, fogSample.depth) : fogSample.depth;
+        }
+    }
 
     // albedo is a half3 lane, so the sky's HDR radiance is clamped to half's finite range rather than
     // allowed to round up to +inf and propagate as NaN through the path throughput. This is a guard, not
@@ -347,5 +309,9 @@ void main(inout Payload payload) {
     payload.roughMetal = packHalf2(float2(1.0, 0.0));
     payload.emissionSss = packHalf2(float2(0.0, 0.0));
     payload.iorTransmission = packHalf2(float2(1.0, 0.0));
-    payload.rayCone = 0u;
+    // The cloud layer's depth rides the rayCone lane: a miss has no ray cone to report (rchit is the only
+    // writer of the packed cone, and it only runs on a hit), and raygen needs a finite depth for the layer
+    // or DLSS-RR reprojects it as infinitely distant sky — which is what leaves the march's step lattice
+    // unconverged in the distance, reading as horizontal banding and ghosting as the wind moves it.
+    payload.rayCone = asuint(guideDepth);
 }
