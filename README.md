@@ -43,6 +43,18 @@ These in-game screenshots were taken with this fork. Appearance also depends on 
 
 ![Offshore tower and distant scenery](docs/gallery/0.5/2026-09-30_19.40.34.png)
 
+### Volumetric clouds and water reflections
+
+![Volumetric clouds and water reflections](docs/gallery/0.5/2026-10-06_03.32.14.jpg)
+
+### Red hurt flash on a mob
+
+![Red hurt flash on a mob](docs/gallery/0.5/2026-10-06_03.31.45.jpg)
+
+### End sky: violet glow, stars and a red moon
+
+![End sky: violet glow, stars and a red moon](docs/gallery/0.5/2026-10-06_02.31.55.jpg)
+
 ## Download and installation
 
 The mod JAR and source archive for this fork are available from [GitHub Releases](https://github.com/LIWED/Caustica-fork/releases).
@@ -125,6 +137,18 @@ Caustica 是用于 Minecraft 26.2 的光线追踪渲染 Mod。本分支保留原
 ### 海上高塔与远景
 
 ![海上高塔与远景](docs/gallery/0.5/2026-09-30_19.40.34.png)
+
+### 体积云与水面反射
+
+![体积云与水面反射](docs/gallery/0.5/2026-10-06_03.32.14.jpg)
+
+### 生物受伤红闪
+
+![生物受伤红闪](docs/gallery/0.5/2026-10-06_03.31.45.jpg)
+
+### 末地天空：紫黑辉光、星空与红色月亮
+
+![末地天空：紫黑辉光、星空与红色月亮](docs/gallery/0.5/2026-10-06_02.31.55.jpg)
 
 ## 下载与安装
 
